@@ -1,411 +1,600 @@
+#!/usr/bin/env python3
+# FC3 Custom Server Implementation
 import socket
 import threading
-import time
+import logging
 import json
 import os
-import sys
-import signal
-import configparser
-import struct
-from datetime import datetime
+import time
+import sqlite3
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
-# Current date and time: 2025-05-03 09:04:14
-# Current user: Saviru
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("fc3_server.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("FC3Server")
 
-# Constants
-DEFAULT_PORT = 9201
-MAX_PLAYERS = 16
-HEARTBEAT_INTERVAL = 30  # seconds
-PLAYER_TIMEOUT = 60  # seconds
-LOG_FILE = "fc3_server_log.txt"
+# Server configuration
+SERVER_PORT = 33333  # Default port
+MAX_PLAYERS = 32
+SERVER_NAME = "Custom FC3 Server"
+PROTOCOL_VERSION = 1.0
+DB_PATH = "fc3_server.db"
 
-# Packet types
-PACKET_CONNECT = 1
-PACKET_DISCONNECT = 2
-PACKET_PLAYER_UPDATE = 3
-PACKET_GAME_EVENT = 4
-PACKET_CHAT_MESSAGE = 5
-PACKET_HEARTBEAT = 6
+# Game constants
+GAME_MODES = {
+    1: "Team Deathmatch",
+    2: "Domination",
+    3: "Firestorm"
+}
 
-class FC3MultiplayerServer:
-    def __init__(self):
-        # Load configuration
-        self.config = configparser.ConfigParser()
-        if os.path.exists('fc3_multiplayer.ini'):
-            self.config.read('fc3_multiplayer.ini')
+@dataclass
+class Player:
+    id: int
+    name: str
+    ip: str
+    port: int
+    session_id: str
+    last_ping: float
+    score: int = 0
+    team: int = 0
+    connected: bool = True
+
+@dataclass
+class GameSession:
+    id: str
+    name: str
+    host_id: int
+    max_players: int
+    game_mode: int
+    map_name: str
+    created_at: float
+    players: Dict[int, Player] = None
+    password: str = ""
+    
+    def __post_init__(self):
+        if self.players is None:
+            self.players = {}
             
-        self.port = self.config.getint('DEFAULT', 'server_port', fallback=DEFAULT_PORT)
-        self.max_players = self.config.getint('DEFAULT', 'max_players', fallback=MAX_PLAYERS)
-        self.game_name = self.config.get('DEFAULT', 'game_name', fallback="FC3 Multiplayer")
+    def add_player(self, player: Player) -> bool:
+        if len(self.players) >= self.max_players:
+            return False
+        self.players[player.id] = player
+        return True
         
-        # Server state
+    def remove_player(self, player_id: int) -> bool:
+        if player_id in self.players:
+            del self.players[player_id]
+            return True
+        return False
+        
+    def is_empty(self) -> bool:
+        return len(self.players) == 0
+
+
+class FC3Server:
+    def __init__(self, config_path="fc3_server.ini"):
+        self.config = self._load_config(config_path)
+        self.port = self.config.get("server", {}).get("port", SERVER_PORT)
+        self.max_players = self.config.get("server", {}).get("max_players", MAX_PLAYERS)
+        self.server_name = self.config.get("server", {}).get("name", SERVER_NAME)
+        
+        self.socket = None
         self.running = False
-        self.clients = {}  # {client_id: {'address': (ip, port), 'last_seen': timestamp, 'data': {...}}}
-        self.next_client_id = 1
-        self.lock = threading.Lock()
+        self.sessions: Dict[str, GameSession] = {}
+        self.players: Dict[int, Player] = {}
+        self.next_player_id = 1
         
-        # Create a UDP socket for the server
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Initialize database
+        self._init_database()
         
-        # Set up signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, self.handle_signal)
-        signal.signal(signal.SIGTERM, self.handle_signal)
+    def _load_config(self, config_path):
+        import configparser
+        import json
         
-        self.log(f"Server initialized with port {self.port}, max players {self.max_players}")
-        self.log(f"Game name: {self.game_name}")
+        config = {
+            "server": {
+                "port": SERVER_PORT,
+                "max_players": MAX_PLAYERS,
+                "name": SERVER_NAME
+            },
+            "game": {
+                "maps": ["Tropical Island", "Jungle", "Mountain Base", "Beach"],
+                "default_mode": 1
+            }
+        }
+        
+        if os.path.exists(config_path):
+            try:
+                parser = configparser.ConfigParser()
+                parser.read(config_path)
+                
+                if "server" in parser:
+                    for key in parser["server"]:
+                        if key == "port":
+                            config["server"]["port"] = parser.getint("server", key)
+                        elif key == "max_players":
+                            config["server"]["max_players"] = parser.getint("server", key)
+                        else:
+                            config["server"][key] = parser.get("server", key)
+                            
+                if "game" in parser:
+                    if "maps" in parser["game"]:
+                        maps_str = parser.get("game", "maps")
+                        config["game"]["maps"] = json.loads(maps_str)
+                    if "default_mode" in parser["game"]:
+                        config["game"]["default_mode"] = parser.getint("game", "default_mode")
+            except Exception as e:
+                logger.error(f"Error loading config: {e}")
+                
+        # Create default config if it doesn't exist
+        if not os.path.exists(config_path):
+            self._save_config(config, config_path)
+                
+        return config
     
-    def log(self, message):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_message = f"[{timestamp}] {message}"
-        print(log_message)
+    def _save_config(self, config, config_path):
+        import configparser
+        import json
         
-        # Also write to log file
-        with open(LOG_FILE, "a") as f:
-            f.write(log_message + "\n")
+        parser = configparser.ConfigParser()
+        
+        for section in config:
+            parser[section] = {}
+            for key, value in config[section].items():
+                if isinstance(value, list):
+                    parser[section][key] = json.dumps(value)
+                else:
+                    parser[section][key] = str(value)
+        
+        with open(config_path, 'w') as f:
+            parser.write(f)
     
-    def handle_signal(self, signum, frame):
-        self.log(f"Received signal {signum}, shutting down server...")
-        self.stop()
+    def _init_database(self):
+        """Initialize SQLite database for persistent storage"""
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Create tables if they don't exist
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS players (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            last_ip TEXT,
+            last_session TEXT,
+            last_seen TIMESTAMP,
+            total_games INTEGER DEFAULT 0,
+            total_score INTEGER DEFAULT 0
+        )
+        ''')
+        
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS game_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            game_mode INTEGER NOT NULL,
+            map_name TEXT NOT NULL,
+            start_time TIMESTAMP,
+            end_time TIMESTAMP,
+            player_count INTEGER NOT NULL
+        )
+        ''')
+        
+        conn.commit()
+        conn.close()
     
     def start(self):
-        if self.running:
-            self.log("Server is already running")
-            return
+        """Start the server"""
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', self.port))
+        self.running = True
         
+        logger.info(f"FC3 Server started on port {self.port}")
+        logger.info(f"Server name: {self.server_name}")
+        
+        # Start maintenance thread
+        threading.Thread(target=self._maintenance_loop, daemon=True).start()
+        
+        # Main server loop
         try:
-            # Bind the socket to the specified port
-            self.socket.bind(('0.0.0.0', self.port))
-            self.running = True
-            
-            self.log(f"Server started on port {self.port}")
-            
-            # Start heartbeat thread
-            self.heartbeat_thread = threading.Thread(target=self.heartbeat_loop)
-            self.heartbeat_thread.daemon = True
-            self.heartbeat_thread.start()
-            
-            # Main server loop
-            self.server_loop()
-            
-        except Exception as e:
-            self.log(f"Error starting server: {e}")
-            self.running = False
-            self.socket.close()
+            while self.running:
+                try:
+                    data, addr = self.socket.recvfrom(4096)
+                    threading.Thread(target=self._handle_packet, args=(data, addr), daemon=True).start()
+                except Exception as e:
+                    logger.error(f"Error in main loop: {e}")
+        finally:
+            self.stop()
     
     def stop(self):
-        if not self.running:
-            return
-        
-        self.log("Stopping server...")
+        """Stop the server"""
         self.running = False
-        
-        # Send disconnect message to all clients
-        with self.lock:
-            for client_id, client_data in self.clients.items():
-                self.send_packet(client_data['address'], PACKET_DISCONNECT, 
-                                {"reason": "Server shutting down"})
-        
-        # Close socket
-        self.socket.close()
-        self.log("Server stopped")
+        if self.socket:
+            self.socket.close()
+        logger.info("Server stopped")
     
-    def heartbeat_loop(self):
-        """Send periodic heartbeats and check for timeouts"""
-        while self.running:
-            current_time = time.time()
-            
-            with self.lock:
-                # Check for client timeouts
-                client_ids = list(self.clients.keys())
-                for client_id in client_ids:
-                    client_data = self.clients[client_id]
-                    if current_time - client_data['last_seen'] > PLAYER_TIMEOUT:
-                        self.log(f"Client {client_id} timed out")
-                        self.clients.pop(client_id)
-                        # Notify other clients
-                        self.broadcast_player_disconnect(client_id)
-                
-                # Send heartbeats to all clients
-                for client_id, client_data in self.clients.items():
-                    self.send_packet(client_data['address'], PACKET_HEARTBEAT, 
-                                   {"server_time": current_time})
-            
-            # Sleep until next heartbeat
-            time.sleep(HEARTBEAT_INTERVAL)
-    
-    def server_loop(self):
-        """Main server loop to handle incoming packets"""
-        self.log("Server loop started")
-        
-        buffer_size = 8192  # Maximum packet size
-        
+    def _maintenance_loop(self):
+        """Background maintenance thread to clean up stale sessions and players"""
         while self.running:
             try:
-                # Receive data from clients
-                data, address = self.socket.recvfrom(buffer_size)
+                current_time = time.time()
                 
-                # Process the received data
-                self.process_packet(data, address)
+                # Remove players who haven't pinged in 30 seconds
+                stale_players = []
+                for player_id, player in self.players.items():
+                    if current_time - player.last_ping > 30:
+                        stale_players.append(player_id)
+                        logger.info(f"Player {player.name} (ID: {player.id}) timed out")
                 
-            except socket.error as e:
-                if self.running:  # Only log errors if server is still running
-                    self.log(f"Socket error: {e}")
-                break
+                for player_id in stale_players:
+                    self._remove_player(player_id)
+                
+                # Remove empty sessions
+                empty_sessions = [session_id for session_id, session in self.sessions.items() 
+                                if session.is_empty()]
+                for session_id in empty_sessions:
+                    logger.info(f"Removing empty session {session_id}")
+                    del self.sessions[session_id]
+                
             except Exception as e:
-                self.log(f"Error in server loop: {e}")
-        
-        self.log("Server loop ended")
+                logger.error(f"Error in maintenance loop: {e}")
+            
+            # Run maintenance every 5 seconds
+            time.sleep(5)
     
-    def process_packet(self, data, address):
-        """Process an incoming packet"""
+    def _handle_packet(self, data: bytes, addr: Tuple[str, int]):
+        """Process incoming packet from a client"""
         try:
-            # Basic packet format: [1 byte packet type][2 bytes data size][data bytes]
-            if len(data) < 3:
+            # Decode packet (simplified format for this example)
+            # In a real implementation, you'd need proper protocol parsing
+            message = data.decode('utf-8').strip()
+            parts = message.split('|')
+            cmd = parts[0]
+            
+            ip, port = addr
+            
+            # Handle different message types
+            if cmd == "PING":
+                self._handle_ping(parts, addr)
+            elif cmd == "REGISTER":
+                self._handle_register(parts, addr)
+            elif cmd == "CREATE_SESSION":
+                self._handle_create_session(parts, addr)
+            elif cmd == "JOIN_SESSION":
+                self._handle_join_session(parts, addr)
+            elif cmd == "LEAVE_SESSION":
+                self._handle_leave_session(parts, addr)
+            elif cmd == "LIST_SESSIONS":
+                self._handle_list_sessions(addr)
+            elif cmd == "GAME_UPDATE":
+                self._handle_game_update(parts, addr)
+            else:
+                logger.warning(f"Unknown command: {cmd} from {addr}")
+        
+        except Exception as e:
+            logger.error(f"Error handling packet: {e}")
+    
+    def _handle_ping(self, parts, addr):
+        """Handle ping requests from clients"""
+        if len(parts) < 2:
+            return
+            
+        player_id = int(parts[1])
+        if player_id in self.players:
+            self.players[player_id].last_ping = time.time()
+            self.socket.sendto(b"PONG", addr)
+    
+    def _handle_register(self, parts, addr):
+        """Register a new player"""
+        if len(parts) < 2:
+            return
+            
+        player_name = parts[1]
+        ip, port = addr
+        
+        # Create new player
+        player_id = self.next_player_id
+        self.next_player_id += 1
+        
+        session_id = ""  # No session initially
+        
+        player = Player(
+            id=player_id,
+            name=player_name,
+            ip=ip,
+            port=port,
+            session_id=session_id,
+            last_ping=time.time()
+        )
+        
+        self.players[player_id] = player
+        logger.info(f"Registered new player: {player_name} (ID: {player_id}) from {ip}:{port}")
+        
+        # Send registration confirmation
+        response = f"REGISTER_OK|{player_id}|{player_name}"
+        self.socket.sendto(response.encode('utf-8'), addr)
+        
+        # Store in database
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO players (id, name, last_ip, last_seen) VALUES (?, ?, ?, datetime('now'))",
+            (player_id, player_name, ip)
+        )
+        conn.commit()
+        conn.close()
+    
+    def _handle_create_session(self, parts, addr):
+        """Create a new game session"""
+        if len(parts) < 5:
+            return
+            
+        player_id = int(parts[1])
+        session_name = parts[2]
+        game_mode = int(parts[3])
+        map_name = parts[4]
+        
+        if player_id not in self.players:
+            return
+            
+        # Generate unique session ID
+        import uuid
+        session_id = str(uuid.uuid4())
+        
+        # Create session
+        session = GameSession(
+            id=session_id,
+            name=session_name,
+            host_id=player_id,
+            max_players=16,  # Default for FC3
+            game_mode=game_mode,
+            map_name=map_name,
+            created_at=time.time()
+        )
+        
+        # Add host to session
+        player = self.players[player_id]
+        player.session_id = session_id
+        session.add_player(player)
+        
+        # Store session
+        self.sessions[session_id] = session
+        
+        logger.info(f"Created new session: {session_name} (ID: {session_id}) by {player.name}")
+        
+        # Send confirmation
+        response = f"SESSION_CREATED|{session_id}|{session_name}"
+        self.socket.sendto(response.encode('utf-8'), addr)
+    
+    def _handle_join_session(self, parts, addr):
+        """Handle a player joining a session"""
+        if len(parts) < 3:
+            return
+            
+        player_id = int(parts[1])
+        session_id = parts[2]
+        
+        if player_id not in self.players or session_id not in self.sessions:
+            response = "JOIN_FAILED|Session not found"
+            self.socket.sendto(response.encode('utf-8'), addr)
+            return
+            
+        player = self.players[player_id]
+        session = self.sessions[session_id]
+        
+        # Check if session is full
+        if len(session.players) >= session.max_players:
+            response = "JOIN_FAILED|Session is full"
+            self.socket.sendto(response.encode('utf-8'), addr)
+            return
+            
+        # Add player to session
+        player.session_id = session_id
+        session.add_player(player)
+        
+        logger.info(f"Player {player.name} joined session {session.name}")
+        
+        # Send all session information to the joining player
+        players_info = []
+        for p in session.players.values():
+            players_info.append(f"{p.id}:{p.name}:{p.team}:{p.score}")
+            
+        players_str = ",".join(players_info)
+        
+        response = f"JOIN_OK|{session_id}|{session.name}|{session.game_mode}|{session.map_name}|{players_str}"
+        self.socket.sendto(response.encode('utf-8'), addr)
+        
+        # Notify all other players in the session
+        self._broadcast_to_session(
+            session_id,
+            f"PLAYER_JOINED|{player.id}|{player.name}",
+            exclude_player=player_id
+        )
+    
+    def _handle_leave_session(self, parts, addr):
+        """Handle a player leaving a session"""
+        if len(parts) < 3:
+            return
+            
+        player_id = int(parts[1])
+        session_id = parts[2]
+        
+        if player_id not in self.players or session_id not in self.sessions:
+            return
+            
+        player = self.players[player_id]
+        session = self.sessions[session_id]
+        
+        # Remove player from session
+        if session.remove_player(player_id):
+            player.session_id = ""
+            logger.info(f"Player {player.name} left session {session.name}")
+            
+            # Notify all other players in the session
+            self._broadcast_to_session(
+                session_id,
+                f"PLAYER_LEFT|{player.id}|{player.name}",
+                exclude_player=player_id
+            )
+            
+            # If host left, assign new host or close session
+            if player_id == session.host_id and not session.is_empty():
+                # Assign first remaining player as host
+                new_host_id = next(iter(session.players.keys()))
+                session.host_id = new_host_id
+                
+                # Notify all players of new host
+                self._broadcast_to_session(
+                    session_id,
+                    f"NEW_HOST|{new_host_id}"
+                )
+            
+            # Confirm to the leaving player
+            response = f"LEAVE_OK|{session_id}"
+            self.socket.sendto(response.encode('utf-8'), addr)
+    
+    def _handle_list_sessions(self, addr):
+        """Send list of active sessions to client"""
+        sessions_info = []
+        
+        for session_id, session in self.sessions.items():
+            session_str = f"{session_id}|{session.name}|{session.game_mode}|{session.map_name}|{len(session.players)}/{session.max_players}"
+            sessions_info.append(session_str)
+            
+        sessions_list = ";".join(sessions_info)
+        response = f"SESSIONS_LIST|{len(self.sessions)}|{sessions_list}"
+        
+        self.socket.sendto(response.encode('utf-8'), addr)
+    
+    def _handle_game_update(self, parts, addr):
+        """Handle game state updates from clients"""
+        if len(parts) < 4:
+            return
+            
+        player_id = int(parts[1])
+        session_id = parts[2]
+        update_type = parts[3]
+        
+        if player_id not in self.players or session_id not in self.sessions:
+            return
+            
+        player = self.players[player_id]
+        session = self.sessions[session_id]
+        
+        # Process different update types
+        if update_type == "SCORE":
+            if len(parts) < 5:
                 return
+                
+            score = int(parts[4])
+            player.score = score
             
-            packet_type = data[0]
-            data_size = struct.unpack('!H', data[1:3])[0]
-            
-            if len(data) < 3 + data_size:
+            # Broadcast score update to all players in session
+            self._broadcast_to_session(
+                session_id,
+                f"SCORE_UPDATE|{player_id}|{score}"
+            )
+        
+        elif update_type == "TEAM":
+            if len(parts) < 5:
                 return
+                
+            team = int(parts[4])
+            player.team = team
             
-            packet_data = data[3:3+data_size]
-            
-            # Handle the packet based on its type
-            if packet_type == PACKET_CONNECT:
-                self.handle_connect(packet_data, address)
-            elif packet_type == PACKET_DISCONNECT:
-                self.handle_disconnect(packet_data, address)
-            elif packet_type == PACKET_PLAYER_UPDATE:
-                self.handle_player_update(packet_data, address)
-            elif packet_type == PACKET_GAME_EVENT:
-                self.handle_game_event(packet_data, address)
-            elif packet_type == PACKET_CHAT_MESSAGE:
-                self.handle_chat_message(packet_data, address)
-            elif packet_type == PACKET_HEARTBEAT:
-                self.handle_heartbeat(packet_data, address)
-            
-        except Exception as e:
-            self.log(f"Error processing packet from {address}: {e}")
-    
-    def handle_connect(self, packet_data, address):
-        """Handle a connection request from a client"""
-        try:
-            # Parse client data
-            client_data = json.loads(packet_data.decode('utf-8'))
-            client_name = client_data.get('name', f"Player{self.next_client_id}")
-            
-            with self.lock:
-                # Check if this client is already connected (by address)
-                for client_id, data in self.clients.items():
-                    if data['address'] == address:
-                        # Update the last seen time
-                        data['last_seen'] = time.time()
-                        # Send the existing client ID back
-                        self.send_packet(address, PACKET_CONNECT, {
-                            "client_id": client_id,
-                            "success": True,
-                            "message": "Reconnected to server"
-                        })
-                        self.log(f"Client {client_id} ({client_name}) reconnected from {address}")
-                        return
-                
-                # Check if server is full
-                if len(self.clients) >= self.max_players:
-                    self.send_packet(address, PACKET_CONNECT, {
-                        "success": False,
-                        "message": "Server is full"
-                    })
-                    self.log(f"Connection from {address} rejected - server full")
-                    return
-                
-                # Assign a new client ID
-                client_id = self.next_client_id
-                self.next_client_id += 1
-                
-                # Store client information
-                self.clients[client_id] = {
-                    'address': address,
-                    'last_seen': time.time(),
-                    'name': client_name,
-                    'data': client_data
-                }
-                
-                # Send confirmation to the client
-                self.send_packet(address, PACKET_CONNECT, {
-                    "client_id": client_id,
-                    "success": True,
-                    "message": "Connected to server",
-                    "server_name": self.game_name,
-                    "player_count": len(self.clients),
-                    "max_players": self.max_players
-                })
-                
-                self.log(f"Client {client_id} ({client_name}) connected from {address}")
-                
-                # Broadcast new player to all other clients
-                self.broadcast_player_connect(client_id, client_name)
+            # Broadcast team update to all players in session
+            self._broadcast_to_session(
+                session_id,
+                f"TEAM_UPDATE|{player_id}|{team}"
+            )
         
-        except Exception as e:
-            self.log(f"Error handling connect from {address}: {e}")
-            self.send_packet(address, PACKET_CONNECT, {
-                "success": False,
-                "message": f"Server error: {str(e)}"
-            })
-    
-    def handle_disconnect(self, packet_data, address):
-        """Handle a client disconnection"""
-        client_id = None
-        
-        with self.lock:
-            # Find the client by address
-            for cid, data in self.clients.items():
-                if data['address'] == address:
-                    client_id = cid
-                    break
-            
-            if client_id is not None:
-                client_name = self.clients[client_id].get('name', f"Player{client_id}")
-                self.clients.pop(client_id)
-                self.log(f"Client {client_id} ({client_name}) disconnected")
+        elif update_type == "GAME_EVENT":
+            if len(parts) < 5:
+                return
                 
-                # Broadcast disconnection to other clients
-                self.broadcast_player_disconnect(client_id)
+            event_data = parts[4]
+            
+            # Broadcast game event to all players in session
+            self._broadcast_to_session(
+                session_id,
+                f"GAME_EVENT|{player_id}|{event_data}"
+            )
     
-    def handle_player_update(self, packet_data, address):
-        """Handle player state update"""
-        client_id = None
+    def _remove_player(self, player_id):
+        """Remove a player and update any sessions they're in"""
+        if player_id not in self.players:
+            return
+            
+        player = self.players[player_id]
         
-        with self.lock:
-            # Find the client by address
-            for cid, data in self.clients.items():
-                if data['address'] == address:
-                    client_id = cid
-                    # Update last seen time
-                    data['last_seen'] = time.time()
-                    break
+        # If player is in a session, remove them
+        if player.session_id and player.session_id in self.sessions:
+            session = self.sessions[player.session_id]
+            session.remove_player(player_id)
             
-            if client_id is not None:
-                try:
-                    # Update player data
-                    player_data = json.loads(packet_data.decode('utf-8'))
-                    self.clients[client_id]['data'].update(player_data)
-                    
-                    # Broadcast update to all other clients
-                    self.broadcast_player_update(client_id, player_data)
-                except:
-                    pass  # Ignore invalid update packets
-    
-    def handle_game_event(self, packet_data, address):
-        """Handle game events like shooting, damage, etc."""
-        client_id = None
+            # Notify other players
+            self._broadcast_to_session(
+                player.session_id,
+                f"PLAYER_LEFT|{player_id}|{player.name}",
+                exclude_player=player_id
+            )
+            
+            # If host left, assign new host or close session
+            if player_id == session.host_id and not session.is_empty():
+                # Assign first remaining player as host
+                new_host_id = next(iter(session.players.keys()))
+                session.host_id = new_host_id
+                
+                # Notify all players of new host
+                self._broadcast_to_session(
+                    player.session_id,
+                    f"NEW_HOST|{new_host_id}"
+                )
         
-        with self.lock:
-            # Find the client by address
-            for cid, data in self.clients.items():
-                if data['address'] == address:
-                    client_id = cid
-                    data['last_seen'] = time.time()
-                    break
-            
-            if client_id is not None:
-                try:
-                    # Parse and broadcast the event
-                    event_data = json.loads(packet_data.decode('utf-8'))
-                    event_data['source_id'] = client_id  # Add source client ID
-                    
-                    # Broadcast to all clients
-                    for other_id, other_data in self.clients.items():
-                        if other_id != client_id:  # Don't send back to source
-                            self.send_packet(other_data['address'], PACKET_GAME_EVENT, event_data)
-                except:
-                    pass  # Ignore invalid event packets
-    
-    def handle_chat_message(self, packet_data, address):
-        """Handle chat messages between players"""
-        client_id = None
+        # Update database
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE players SET last_seen = datetime('now') WHERE id = ?",
+            (player_id,)
+        )
+        conn.commit()
+        conn.close()
         
-        with self.lock:
-            # Find the client by address
-            for cid, data in self.clients.items():
-                if data['address'] == address:
-                    client_id = cid
-                    data['last_seen'] = time.time()
-                    break
+        # Remove player
+        del self.players[player_id]
+        logger.info(f"Removed player {player.name} (ID: {player_id})")
+    
+    def _broadcast_to_session(self, session_id, message, exclude_player=None):
+        """Send a message to all players in a session"""
+        if session_id not in self.sessions:
+            return
             
-            if client_id is not None:
-                try:
-                    # Parse message data
-                    message_data = json.loads(packet_data.decode('utf-8'))
-                    sender_name = self.clients[client_id].get('name', f"Player{client_id}")
-                    
-                    # Add sender info
-                    message_data['sender_id'] = client_id
-                    message_data['sender_name'] = sender_name
-                    
-                    # Log the message
-                    self.log(f"Chat: [{sender_name}] {message_data.get('message', '')}")
-                    
-                    # Broadcast to all clients
-                    for other_id, other_data in self.clients.items():
-                        self.send_packet(other_data['address'], PACKET_CHAT_MESSAGE, message_data)
-                except:
-                    pass  # Ignore invalid message packets
-    
-    def handle_heartbeat(self, packet_data, address):
-        """Handle heartbeat packets from clients"""
-        with self.lock:
-            # Find the client by address
-            for cid, data in self.clients.items():
-                if data['address'] == address:
-                    # Update last seen time
-                    data['last_seen'] = time.time()
-                    break
-    
-    def broadcast_player_connect(self, client_id, client_name):
-        """Broadcast a player connection to all other clients"""
-        with self.lock:
-            for other_id, other_data in self.clients.items():
-                if other_id != client_id:
-                    self.send_packet(other_data['address'], PACKET_CONNECT, {
-                        "new_player_id": client_id,
-                        "new_player_name": client_name
-                    })
-    
-    def broadcast_player_disconnect(self, client_id):
-        """Broadcast a player disconnection to all other clients"""
-        with self.lock:
-            for other_id, other_data in self.clients.items():
-                if other_id != client_id:
-                    self.send_packet(other_data['address'], PACKET_DISCONNECT, {
-                        "player_id": client_id
-                    })
-    
-    def broadcast_player_update(self, client_id, player_data):
-        """Broadcast a player update to all other clients"""
-        with self.lock:
-            # Add player_id to the data
-            data_with_id = player_data.copy()
-            data_with_id['player_id'] = client_id
-            
-            for other_id, other_data in self.clients.items():
-                if other_id != client_id:
-                    self.send_packet(other_data['address'], PACKET_PLAYER_UPDATE, data_with_id)
-    
-    def send_packet(self, address, packet_type, data):
-        """Send a packet to a client"""
-        try:
-            # Convert data to JSON string
-            json_data = json.dumps(data).encode('utf-8')
-            
-            # Create packet: [1 byte packet type][2 bytes data size][data bytes]
-            packet = bytes([packet_type]) + struct.pack('!H', len(json_data)) + json_data
-            
-            # Send the packet
-            self.socket.sendto(packet, address)
-        except Exception as e:
-            self.log(f"Error sending packet to {address}: {e}")
+        session = self.sessions[session_id]
+        
+        encoded_message = message.encode('utf-8')
+        
+        for player_id, player in session.players.items():
+            if exclude_player is not None and player_id == exclude_player:
+                continue
+                
+            addr = (player.ip, player.port)
+            try:
+                self.socket.sendto(encoded_message, addr)
+            except Exception as e:
+                logger.error(f"Failed to send message to player {player.name}: {e}")
+
 
 if __name__ == "__main__":
-    server = FC3MultiplayerServer()
-    server.start()
+    server = FC3Server()
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        server.stop()
