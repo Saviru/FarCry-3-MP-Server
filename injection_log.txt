@@ -1,0 +1,2 @@
+[2025-05-03 09:55:57] User Saviru attempting to inject c:\Users\savir\Desktop\farcry 3 server\fc3_multiplayer.dll into C:\Games\Far Cry 3\Far Cry 3\bin\farcry3.exe
+[2025-05-03 09:55:57] User Saviru successfully injected c:\Users\savir\Desktop\farcry 3 server\fc3_multiplayer.dll into process 320856
